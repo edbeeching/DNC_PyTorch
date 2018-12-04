@@ -83,7 +83,7 @@ class Access(nn.Module):
                                   + [params.mem_size] + [1] \
                                   + [params.mem_size]*2 \
                                   + [params.mem_size] \
-                                  + [1] + [1] + [params.mem_size]*params.num_read_heads
+                                  + [1] + [1] + [3]*params.num_read_heads # 3 read modes
              
                                   
     def split(self, i_vec):
@@ -149,6 +149,7 @@ class Access(nn.Module):
     def forward(self, x, memory, a_state, link_matrix):
         r_weights, w_weights, usage, precedence = a_state
         
+        print('Interfacing')
         interface_vector = self.interface_linear(x)
         
         split = self.split(interface_vector)
@@ -157,18 +158,20 @@ class Access(nn.Module):
         allocations, usage = self.get_allocations(r_weights, w_weights, usage, f_gates)
               
         # write to the momory
+        print('Writing')
         w_weights, memory, link_matrix, precedence = self.write_head(w_key, w_beta, e_vector, w_vector, a_gate, w_gate, allocations, memory, link_matrix, precedence)    
     
         # read the memory
+        print('Reading')
         reads = []
-        r_weights = []
-        for read_head, r_key, r_beta, r_mode in zip(self.read_heads, r_keys, r_betas, r_modes):
-            r_mode = F.softmax(r_mode, 1)
-            read, r_weight = read_head(r_key, r_beta, r_mode, memory)
+        r_weights_out = []
+        for i in range(self.params.num_read_heads):
+        #for read_head, r_key, r_beta, r_mode in zip(self.read_heads, r_keys, r_betas, r_modes):
+            read, r_weight = self.read_heads[i](r_keys[i], r_betas[i], r_modes[i], r_weights[:, i], memory, link_matrix)
             reads.append(read)
-            r_weights.append(r_weight)
-
-        return torch.cat(reads, 1), memory, (torch.cat(r_weights,1), w_weights, usage, precedence)
+            r_weights_out.append(r_weight)
+        print('Returning')
+        return torch.cat(reads, 1), memory, (torch.stack(r_weights_out, 1), w_weights, usage, precedence)
 
 class HeadFuncs:
     @staticmethod
@@ -190,16 +193,20 @@ class HeadFuncs:
 class ReadHead(nn.Module):
     def __init__(self):
         super(ReadHead, self).__init__()
-        pass
     
-    def forward(self, r_key, r_beta, r_mode, memory):
-        weights = HeadFuncs.query(r_key, r_beta, memory)
-        return (memory*weights.unsqueeze(2)).sum(1), weights
+    def forward(self, r_key, r_beta, r_mode, r_weights, memory, link_matrix):
+        r_mode = F.softmax(r_mode, 1)
+        c_weights = HeadFuncs.query(r_key, r_beta, memory)
+        f_weights = torch.bmm(link_matrix, r_weights.unsqueeze(2)).squeeze(2)
+        b_weights = torch.bmm(link_matrix.transpose(1,2), r_weights.unsqueeze(2)).squeeze(2)
+        
+        weights = r_mode[:,0]*b_weights + r_mode[:,1]*c_weights + r_mode[:,2]*f_weights
+        
+        return torch.bmm(weights.unsqueeze(1), memory), weights
 
 class WriteHead(nn.Module):
     def __init__(self, params):
         super(ReadHead, self).__init__()
-        pass
     
     @staticmethod
     def update_link(link, weights, precedence):
@@ -209,7 +216,7 @@ class WriteHead(nn.Module):
         assert weights.size() == precedence.size()
         w_i = weights.unsqueeze(2).repeat(1,1,w)
         w_j = weights.unsqueeze(1).repeat(1,h,1)
-        p_j = prec.unsqueeze(1).repeat(1,h,1)
+        p_j = precedence.unsqueeze(1).repeat(1,h,1)
         
         link = (1 - w_i - w_j)*link + w_i*p_j
         
@@ -221,55 +228,29 @@ class WriteHead(nn.Module):
     
     def forward(self, w_key, w_beta, e_vector, w_vector, a_gate, w_gate, allocations, memory, link_matrix, precedence):
         c_weights = HeadFuncs.query(w_key, w_beta, memory)
+        
+        b,h,w = memory.size()
+        assert (c_weights.size() == (b,h))
+        assert (w_vector.size() == (b,w))
+        assert (w_key.size() == (b,w))
+        
         assert (c_weights.size() == allocations.size() == precedence.size())
         assert (w_key.size() == e_vector.size() == w_vector.size())
         w_gate = F.sigmoid(w_gate)
         a_gate = F.sigmoid(a_gate)
-        
-        w_weights = w_gate*(a_gate*allocations + (1-a_gate)*c_weights)
-        
-        
-        
-        
-        
-        
-        
         e_vector = F.sigmoid(e_vector)
         
-        
-
+        w_weights = w_gate*(a_gate*allocations + (1-a_gate)*c_weights)        
         link_matrix = self.update_link(link_matrix, w_weights, precedence)
-        precedence = (1 - w_weights.sum(1, keepdum=True)) * precedence + w_weights
+        
+        memory = memory*(torch.ones_like(memory) \
+                - torch.bmm(w_weights.unsqueeze(2), e_vector.unsqueeze(1))) \
+                + torch.bmm(w_weights.unsqueeze(2), w_vector.unsqueeze(1))
+        
+        precedence = (1 - w_weights.sum(1, keepdim=True)) * precedence + w_weights
         
         return w_weights, memory, link_matrix, precedence
 
-
-def link1(link, weights, prec):
-    
-    b,h,w = link.size()
-    
-    link_1 = torch.zeros_like(link)
-    for i in range(h):
-        for j in range(w):
-            if i==j: continue
-            link_1[:, i,j] = (1 - weights[:,i] - weights[:,j])*link[:,i,j] + weights[:, i]*prec[:, j]
-
-    return link_1
-            
-def link2(link, weights, prec):
-    
-    b,h,w = link.size()            
-    assert h == w
-    w_i = weights.unsqueeze(2).repeat(1,1,w)
-    w_j = weights.unsqueeze(1).repeat(1,h,1)
-    p_j = prec.unsqueeze(1).repeat(1,h,1)
-    
-    link2 = (1 - w_i - w_j)*link + w_i*p_j
-    
-    mask = 1 -torch.eye(h).unsqueeze(0).repeat(b,1,1)
-    link2 = link2*mask
-    
-    return link2
     
 
 if __name__ == "__main__":
@@ -281,12 +262,24 @@ if __name__ == "__main__":
 
     link = torch.rand(2,size,size)
     
-    link_1 = link1(link, weights, prec)
-    print(link_1)
-    link_2 = link2(link, weights, prec)
-    print(link_2)
-    link_3 = WriteHead.update_link(link, weights, prec)
-    print(link_3)
-    print(link_1 == link_2)
-    print(link_1 == link_3)
+    torch.bmm(link, weights.unsqueeze(2))
     
+    a = torch.randn(2,2,3)
+    b = torch.randn(2,3,1)
+    
+    c = torch.bmm(a,b)
+
+    print(a)
+    print(b)
+    print(c)
+
+    weights = []
+    for i in range(3):
+        w =torch.randn(2,4)
+        weights.append(w)
+        
+        
+    print(torch.stack(weights,1).size())
+    
+    weights =  torch.stack(weights,1)
+
