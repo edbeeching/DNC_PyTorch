@@ -13,7 +13,6 @@ from torch import nn
 import torch.nn.functional as F
 
 
-
 def one_plus(x):
     return 1 + (1+x.exp()).log()
 
@@ -34,18 +33,22 @@ def index_slice(x, sizes):
     
         cur = ind
     return outputs
-    
-    
-    
 
 class DNC(nn.Module):
     def __init__(self, params):
         super(DNC, self).__init__()
 
         self.params = params
-        self.controller = nn.LSTM(params.c_in_size, params.c_out_size)
+        self.controller = nn.LSTMCell(params.c_in_size, params.c_out_size)
         self.access = Access(params)
         self.linear = nn.Linear(params.l_in_size, params.l_out_size)
+        
+        nn.init.orthogonal_(self.controller.weight_hh)
+        nn.init.orthogonal_(self.controller.weight_ih)
+        nn.init.orthogonal_(self.linear.weight)
+        self.linear.weight.data.fill_(0.0)
+        
+        
 
     def forward(self, x, state):
         read = state['read']
@@ -54,12 +57,17 @@ class DNC(nn.Module):
         a_state = state['a_state']
         link_matrix = state['link_matrix']
         # get the controller output
-        control_out, c_state = self.controller(torch.cat([x, read], 0), c_state)
+        h,c = c_state
+        control_out, cell_state = self.controller(torch.cat([x, read], 1), c_state)
+
+        c_state = ( control_out, cell_state)
 
         # split the controller output into interface and control vectors
         read, memory, a_state, link_matrix  = self.access(control_out, memory, a_state, link_matrix)
-        output = self.linear(torch.cat([control_out, read], 0))
-
+        
+        output = self.linear(torch.cat([control_out, read], 1))
+ 
+        
         state = {'read': read,
                 'c_state': c_state,
                 'a_state': a_state,
@@ -68,22 +76,55 @@ class DNC(nn.Module):
 
         return output, state
 
-    def reset_memory(self):
-        pass
+    def reset(self):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        read = torch.zeros(self.params.batch_size, 
+                         self.params.num_read_heads * self.params.mem_size).to(device)
+        
+        hidden = torch.zeros(self.params.batch_size, self.params.c_out_size).to(device)
+        cells = torch.zeros(self.params.batch_size, self.params.c_out_size) .to(device)
+        c_state = (hidden,cells)
+        memory = torch.zeros(self.params.batch_size, self.params.memory_n, self.params.mem_size).to(device)
+        link_matrix = torch.zeros(self.params.batch_size, self.params.memory_n, self.params.memory_n).to(device)
+        
+        r_weights = torch.zeros(self.params.batch_size, self.params.num_read_heads, self.params.memory_n).to(device)
+        w_weights = torch.zeros(self.params.batch_size, self.params.memory_n).to(device)
+        usage = torch.zeros(self.params.batch_size, self.params.memory_n).to(device)
+        precedence = torch.zeros(self.params.batch_size, self.params.memory_n).to(device)
+        
+        a_state = r_weights, w_weights, usage, precedence
+        
+        state = {'read': read,
+                'c_state': c_state,
+                'a_state': a_state,
+                'memory': memory,
+                'link_matrix': link_matrix}       
+        
+        return state
+    
+        
+        
+        
 
 class Access(nn.Module):
     def __init__(self, params):
         super(Access, self).__init__()
         self.params = params
-        self.interface_linear = nn.Linear(params.c_out_size, params.interface_size)
-        self.read_heads = [ReadHead(params) for _ in range(params.num_read_heads)]
-        self.write_head = ReadHead(params)
+        self.read_heads = [ReadHead() for _ in range(params.num_read_heads)]
+        self.write_head = WriteHead()
         
         self.interface_indices = [params.mem_size]*params.num_read_heads + [1]*params.num_read_heads \
                                   + [params.mem_size] + [1] \
                                   + [params.mem_size]*2 \
-                                  + [params.mem_size] \
+                                  + [1]*params.num_read_heads \
                                   + [1] + [1] + [3]*params.num_read_heads # 3 read modes
+                                  
+        interface_size = sum(self.interface_indices)
+        self.interface_linear = nn.Linear(params.c_out_size, interface_size)
+        
+        nn.init.orthogonal_(self.interface_linear.weight)
+        
+        self.interface_linear.bias.data.fill_(0.0)
              
                                   
     def split(self, i_vec):
@@ -130,11 +171,7 @@ class Access(nn.Module):
             cur += 1        
         
         return r_keys, r_betas, w_key, w_beta, e_vector, w_vector, fgates, a_gate, w_gate, r_modes
-      
-
-        
-        
-    
+ 
     @staticmethod
     def get_allocations(r_weights, w_weights, usage, f_gates):
         retention = torch.prod(1 - F.sigmoid(torch.cat(f_gates, 1)).unsqueeze(2)*r_weights, 1)
@@ -148,8 +185,6 @@ class Access(nn.Module):
 
     def forward(self, x, memory, a_state, link_matrix):
         r_weights, w_weights, usage, precedence = a_state
-        
-        print('Interfacing')
         interface_vector = self.interface_linear(x)
         
         split = self.split(interface_vector)
@@ -158,26 +193,21 @@ class Access(nn.Module):
         allocations, usage = self.get_allocations(r_weights, w_weights, usage, f_gates)
               
         # write to the momory
-        print('Writing')
         w_weights, memory, link_matrix, precedence = self.write_head(w_key, w_beta, e_vector, w_vector, a_gate, w_gate, allocations, memory, link_matrix, precedence)    
     
         # read the memory
-        print('Reading')
         reads = []
         r_weights_out = []
         for i in range(self.params.num_read_heads):
-        #for read_head, r_key, r_beta, r_mode in zip(self.read_heads, r_keys, r_betas, r_modes):
             read, r_weight = self.read_heads[i](r_keys[i], r_betas[i], r_modes[i], r_weights[:, i], memory, link_matrix)
-            reads.append(read)
+            reads.append(read.squeeze(1))
             r_weights_out.append(r_weight)
-        print('Returning')
-        return torch.cat(reads, 1), memory, (torch.stack(r_weights_out, 1), w_weights, usage, precedence)
+        return torch.cat(reads, 1), memory, (torch.stack(r_weights_out, 1), w_weights, usage, precedence), link_matrix
 
 class HeadFuncs:
     @staticmethod
     def query(key, beta, memory):
         if len(key.size()) < len(memory.size()):
-            #print('resizing key')
             h,w = key.size()
             key = key.view(h,1,w)
             
@@ -199,18 +229,19 @@ class ReadHead(nn.Module):
         c_weights = HeadFuncs.query(r_key, r_beta, memory)
         f_weights = torch.bmm(link_matrix, r_weights.unsqueeze(2)).squeeze(2)
         b_weights = torch.bmm(link_matrix.transpose(1,2), r_weights.unsqueeze(2)).squeeze(2)
-        
-        weights = r_mode[:,0]*b_weights + r_mode[:,1]*c_weights + r_mode[:,2]*f_weights
+        # slice to retrain original dims
+        weights = r_mode[:,0:1]*b_weights + r_mode[:,1:2]*c_weights + r_mode[:,2:3] * f_weights
         
         return torch.bmm(weights.unsqueeze(1), memory), weights
 
 class WriteHead(nn.Module):
-    def __init__(self, params):
-        super(ReadHead, self).__init__()
+    def __init__(self):
+        super(WriteHead, self).__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     @staticmethod
     def update_link(link, weights, precedence):
-        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         b,h,w = link.size()            
         assert h == w
         assert weights.size() == precedence.size()
@@ -220,7 +251,7 @@ class WriteHead(nn.Module):
         
         link = (1 - w_i - w_j)*link + w_i*p_j
         
-        mask = 1 -torch.eye(h).unsqueeze(0).repeat(b,1,1)
+        mask = 1 -torch.eye(h).unsqueeze(0).repeat(b,1,1).to(device)
         link = link*mask        
         
         return link
@@ -252,34 +283,53 @@ class WriteHead(nn.Module):
         return w_weights, memory, link_matrix, precedence
 
     
+class Params:
+    def __init__(self):
+        self.input_size = 8
+        self.c_out_size = 64
+        self.l_out_size = self.input_size-1
+        self.mem_size = 16
+        self.memory_n = 32    
+        self.batch_size = 16
+        self.num_read_heads = 3
+        self.seq_length = 20
+        
+        self.l_in_size = self.c_out_size + self.num_read_heads * self.mem_size
+        self.c_in_size = self.input_size + self.num_read_heads * self.mem_size        
+    
 
 if __name__ == "__main__":
-    
-    size = 4
+       
+    params = Params()
 
-    weights = F.softmax(torch.rand(2, size),1)
-    prec = F.softmax(torch.rand(2, size),1)
+    dnc = DNC(params)
 
-    link = torch.rand(2,size,size)
+    read = torch.zeros(params.batch_size, 
+                             params.num_read_heads*params.mem_size)
     
-    torch.bmm(link, weights.unsqueeze(2))
+    hidden = torch.zeros(params.batch_size, params.c_out_size)
+    cells = torch.zeros(params.batch_size, params.c_out_size) 
+    c_state = (hidden,cells)
+    memory = torch.zeros(params.batch_size, params.memory_n, params.mem_size)
+    link_matrix = torch.zeros(params.batch_size, params.memory_n, params.memory_n)
     
-    a = torch.randn(2,2,3)
-    b = torch.randn(2,3,1)
+    r_weights = torch.zeros(params.batch_size, params.num_read_heads, params.memory_n)
+    w_weights = torch.zeros(params.batch_size, params.memory_n)
+    usage = torch.zeros(params.batch_size, params.memory_n)
+    precedence = torch.zeros(params.batch_size, params.memory_n)
     
-    c = torch.bmm(a,b)
-
-    print(a)
-    print(b)
-    print(c)
-
-    weights = []
-    for i in range(3):
-        w =torch.randn(2,4)
-        weights.append(w)
-        
-        
-    print(torch.stack(weights,1).size())
     
-    weights =  torch.stack(weights,1)
-
+    a_state = r_weights, w_weights, usage, precedence
+    
+    state = {'read': read,
+            'c_state': c_state,
+            'a_state': a_state,
+            'memory': memory,
+            'link_matrix': link_matrix}
+    
+    x = torch.randn(params.batch_size, params.input_size)
+    
+    
+    for i in range(1000):
+        x, state2 = dnc(x, state)
+    
